@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>7x7 Escape Grid</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="game-shell">
+      <section class="hud" aria-label="Game status">
+        <div class="move-status">
+          <p class="label">Move status</p>
+          <div id="move-strip" class="move-strip" aria-label="Move status"></div>
+        </div>
+        <div class="hud-actions">
+          <button id="auto-button" type="button">Auto</button>
+          <button id="restart-button" type="button">Restart</button>
+        </div>
+      </section>
+
+      <section class="board-wrap" aria-label="7 by 7 game board">
+        <div id="board" class="board"></div>
+      </section>
+
+      <section class="controls" aria-label="Movement controls">
+        <button type="button" class="control empty" aria-hidden="true" tabindex="-1"></button>
+        <button type="button" class="control" data-move="up" aria-label="Move up">&uarr;</button>
+        <button type="button" class="control empty" aria-hidden="true" tabindex="-1"></button>
+        <button type="button" class="control" data-move="left" aria-label="Move left">&larr;</button>
+        <button type="button" class="control" data-move="down" aria-label="Move down">&darr;</button>
+        <button type="button" class="control" data-move="right" aria-label="Move right">&rarr;</button>
+      </section>
+
+      <p id="message" class="message" role="status" aria-live="polite"></p>
+    </main>
+
+    <script src="game.js"></script>
+  </body>
+</html>
