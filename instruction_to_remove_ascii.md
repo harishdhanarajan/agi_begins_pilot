@@ -1,0 +1,2 @@
+To remove later: delete the # ---- VIZ ---- block in agent.py (~40 lines), the watch parameters on collect_transitions and discover, and the --watch flag
+  in main.py. One contiguous deletion per file.

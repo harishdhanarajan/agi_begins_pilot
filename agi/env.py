@@ -16,9 +16,9 @@ Everything else the agent must discover. In particular:
   otherwise. the agent must still discover *what makes* a state good;
   the reward signal is the only "outcome" hint, no shaping.
 
-The rules (7 wide, 25 moves, random start, exit at far corner) mirror
-the JavaScript game in this repo, so a human can play the JS version
-and the agent the Python version with the same dynamics.
+The default rules mirror the JavaScript game in this repo, but constructor
+parameters can change the world size and move budget without changing agent
+code.
 """
 
 from __future__ import annotations

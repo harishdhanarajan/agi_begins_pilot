@@ -44,7 +44,9 @@ class Predictor(nn.Module):
 
     Pure MLP. Predicts in latent space, never in pixel space — this is JEPA's
     central bet, and it makes the loss meaningful even when much of the pixel
-    detail is irrelevant.
+    detail is irrelevant. Single-output by design: reward awareness is the
+    value head's job, on the encoder side, so the predictor's trunk is not
+    asked to balance conflicting objectives.
     """
 
     def __init__(self, latent_dim: int = 32, num_actions: int = 4, hidden: int = 128) -> None:
@@ -59,3 +61,26 @@ class Predictor(nn.Module):
 
     def forward(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         return self.net(torch.cat([z, a], dim=-1))
+
+
+class ValueHead(nn.Module):
+    """latent -> scalar V.
+
+    Predicts expected (undiscounted) future return from a given latent state.
+    Trained by TD(0) bootstrap: V(s) <- r + (1 - done) * V(s'). The input
+    latent is fed in detached, so value learning does not perturb the encoder
+    that the JEPA loss is responsible for shaping. Without this shielding,
+    encoder and value heads compete for the same representation and JEPA's
+    latent loss fails to converge (the brick-3 lesson).
+    """
+
+    def __init__(self, latent_dim: int = 32, hidden: int = 128) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z).squeeze(-1)
