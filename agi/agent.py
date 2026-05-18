@@ -61,14 +61,32 @@ def collect_transitions(
     env: AgentEnv,
     num_episodes: int,
     rng: np.random.Generator,
+    learner: "JEPALearner | None" = None,
 ) -> list[Transition]:
+    """Collect transitions for `num_episodes` episodes.
+
+    If `learner` is provided, actions are chosen by `learner.select_action`
+    (novelty-biased). Otherwise actions are uniform random — that path is
+    the bootstrap used in the very first cycle of `discover`, before the
+    learner has any useful predictor.
+
+    Every observed frame is registered with the learner's buffer so the next
+    cycle's action selection has more to compare against.
+    """
     transitions: list[Transition] = []
     for _ in range(num_episodes):
         s = env.reset()
+        if learner is not None:
+            learner.observe(s)
         while True:
-            a = int(rng.integers(0, env.num_actions))
+            if learner is not None:
+                a = learner.select_action(s, rng)
+            else:
+                a = int(rng.integers(0, env.num_actions))
             sp, done, r = env.step(a)
             transitions.append((s, a, sp, r, done))
+            if learner is not None:
+                learner.observe(sp)
             s = sp
             if done:
                 break
@@ -112,6 +130,14 @@ class JEPALearner:
         )
         self.ema_decay = ema_decay
 
+        # novelty buffer: deduped seen frames (by raw pixels) and a cached
+        # tensor of their target-encoder embeddings. select_action compares
+        # the predictor's ẑ_next against this buffer; the action whose
+        # predicted next-latent is farthest from anything already seen wins.
+        self._seen_pixels: set[bytes] = set()
+        self._seen_frames: list[np.ndarray] = []
+        self._buffer_z: torch.Tensor | None = None
+
     def train_step(
         self,
         frames_t: torch.Tensor,
@@ -141,6 +167,65 @@ class JEPALearner:
         out = self.encoder(_frames_to_tensor(frames))
         self.encoder.train()
         return out
+
+    # ---- novelty buffer ----
+
+    def observe(self, frame: np.ndarray) -> None:
+        """Register a frame as 'seen'. Dedup is by raw pixels, so a finite
+        world has a finite buffer no matter how many transitions we collect."""
+        h = frame.tobytes()
+        if h in self._seen_pixels:
+            return
+        self._seen_pixels.add(h)
+        self._seen_frames.append(frame)
+
+    @torch.no_grad()
+    def refresh_buffer(self) -> None:
+        """Re-encode the seen frames with the current target encoder. Call this
+        between training chunks so novelty distances reflect the latest model."""
+        if not self._seen_frames:
+            self._buffer_z = None
+            return
+        self.target_encoder.eval()
+        self._buffer_z = self.target_encoder(_frames_to_tensor(self._seen_frames))
+
+    @torch.no_grad()
+    def select_action(
+        self,
+        frame: np.ndarray,
+        rng: np.random.Generator,
+    ) -> int:
+        """Pick an action biased toward predicted-novel next states.
+
+        For each candidate action a, predict ẑ_next = predictor(encoder(s), a),
+        then measure its distance to the nearest entry in the seen-frames
+        buffer. Sample an action with probability ∝ softmax(d / mean(d)).
+        Self-tuning: when all actions look equally novel the distribution is
+        near-uniform; when one stands out it dominates. No magic temperature.
+
+        Falls back to uniform random when the buffer has fewer entries than
+        the action count — not enough data to compare actions yet.
+        """
+        if self._buffer_z is None or self._buffer_z.shape[0] < self.num_actions:
+            return int(rng.integers(0, self.num_actions))
+
+        self.encoder.eval()
+        z = self.encoder(_frames_to_tensor([frame]))
+        self.encoder.train()
+
+        distances = np.zeros(self.num_actions, dtype=np.float64)
+        for a in range(self.num_actions):
+            a_oh = _one_hot([a], self.num_actions)
+            z_hat = self.predictor(z, a_oh)
+            distances[a] = float(torch.cdist(z_hat, self._buffer_z).min().item())
+
+        mean_d = float(distances.mean())
+        if mean_d < 1e-9:
+            return int(rng.integers(0, self.num_actions))
+        logits = distances / mean_d
+        e = np.exp(logits - logits.max())
+        probs = e / e.sum()
+        return int(rng.choice(self.num_actions, p=probs))
 
 
 def train(
@@ -346,18 +431,51 @@ def discover(
     train_steps: int = 5000,
     batch_size: int = 64,
     latent_dim: int = 32,
+    num_cycles: int = 10,
     seed: int = 0,
 ) -> dict:
+    """Closed-loop discovery: alternate collection and training.
+
+    The loop is `num_cycles` rounds of (collect a chunk, train a chunk). The
+    first chunk is uniform random (no learner yet); every subsequent chunk
+    uses the partially-trained learner to bias action choice toward
+    predicted-novel next states. Total work matches the old single-shot
+    version — only the *interleaving* is new, plus the novelty-biased action
+    selection that the interleaving makes possible.
+    """
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
 
-    print(f"[learner] collecting transitions over {num_episodes} episodes")
-    transitions = collect_transitions(env, num_episodes, rng)
-    print(f"[learner] recorded {len(transitions)} transitions")
+    ep_per_cycle = max(1, num_episodes // num_cycles)
+    steps_per_cycle = max(1, train_steps // num_cycles)
 
     learner = JEPALearner(num_actions=env.num_actions, latent_dim=latent_dim)
-    print(f"[learner] training JEPA world model for {train_steps} steps")
-    history = train(learner, transitions, num_steps=train_steps, batch_size=batch_size, rng=rng)
+    transitions: list[Transition] = []
+    history: list[float] = []
+    per_cycle_outcomes: list[dict] = []
+
+    for cycle in range(num_cycles):
+        # cycle 0 uses random actions to seed the buffer; from cycle 1 onward
+        # the learner's predictor drives action selection.
+        actor = learner if cycle > 0 else None
+        print(f"[learner] cycle {cycle + 1}/{num_cycles}  collecting {ep_per_cycle} episodes "
+              f"({'novelty-biased' if actor else 'uniform random — bootstrap'})")
+        chunk = collect_transitions(env, ep_per_cycle, rng, learner=actor)
+        per_cycle_outcomes.append(probe_termination(chunk))
+        transitions.extend(chunk)
+
+        print(f"[learner] cycle {cycle + 1}/{num_cycles}  training {steps_per_cycle} steps "
+              f"on {len(transitions)} accumulated transitions")
+        h = train(
+            learner,
+            transitions,
+            num_steps=steps_per_cycle,
+            batch_size=batch_size,
+            rng=rng,
+            log_every=0,
+        )
+        history.extend(h)
+        learner.refresh_buffer()
 
     seen: dict[bytes, np.ndarray] = {}
     for s, _a, sp, _r, _done in transitions:
@@ -375,6 +493,7 @@ def discover(
         "manifold": probe_manifold_dimension(latents),
         "action_geometry": probe_action_geometry(learner, transitions),
         "termination": probe_termination(transitions),
+        "per_cycle_outcomes": per_cycle_outcomes,
     }
 
 
@@ -390,6 +509,11 @@ def explain(report: dict) -> str:
         lines.append(f"  avg steps to success: {t['avg_steps_to_success']:.1f}")
     if t["num_successful"] < t["num_episodes"]:
         lines.append(f"  avg steps to failure: {t['avg_steps_to_failure']:.1f}")
+
+    if "per_cycle_outcomes" in report and report["per_cycle_outcomes"]:
+        per_cycle = report["per_cycle_outcomes"]
+        rates = [f"{c['success_rate']:.0%}" for c in per_cycle]
+        lines.append(f"  per-cycle success rate: {' -> '.join(rates)}")
 
     conv = report["convergence"]
     lines.append(
