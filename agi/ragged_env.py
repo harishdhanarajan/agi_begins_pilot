@@ -53,7 +53,7 @@ class RaggedGridEnv:
         self._terminated = False
         return self._render()
 
-    def step(self, action: int) -> tuple[np.ndarray, bool]:
+    def step(self, action: int) -> tuple[np.ndarray, bool, float]:
         if self._terminated:
             raise RuntimeError("episode is over; call reset() first")
         if not 0 <= action < self.num_actions:
@@ -67,7 +67,9 @@ class RaggedGridEnv:
         self._moves_left -= 1
         if self._moves_left <= 0:
             self._terminated = True
-        return self._render(), self._terminated
+        # no goal in this env yet; reward is always zero. signature kept
+        # uniform with the goal-bearing envs so downstream code stays generic.
+        return self._render(), self._terminated, 0.0
 
     _VOID = np.array([8, 8, 12], dtype=np.uint8)
     _BG = np.array([24, 24, 32], dtype=np.uint8)

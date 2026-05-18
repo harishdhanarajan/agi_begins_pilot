@@ -4,7 +4,7 @@ This file is the world the agent inhabits. It deliberately exposes the
 minimum possible interface:
 
     obs = env.reset()
-    obs, done = env.step(action)
+    obs, done, reward = env.step(action)
     env.num_actions  # how many opaque action handles exist
 
 Everything else the agent must discover. In particular:
@@ -12,8 +12,9 @@ Everything else the agent must discover. In particular:
 * observations are pixels, not symbolic state.
 * action handles are integers 0..N-1 with no semantic name.
   the env never tells the agent which one is "up".
-* there is no reward signal. episode termination is the only structural
-  hint, and even that is just a boolean.
+* rewards are sparse: a positive number on a "good" terminal state, zero
+  otherwise. the agent must still discover *what makes* a state good;
+  the reward signal is the only "outcome" hint, no shaping.
 
 The rules (7 wide, 25 moves, random start, exit at far corner) mirror
 the JavaScript game in this repo, so a human can play the JS version
@@ -72,7 +73,7 @@ class EscapeGridEnv:
         self._terminated = False
         return self._render()
 
-    def step(self, action: int) -> tuple[np.ndarray, bool]:
+    def step(self, action: int) -> tuple[np.ndarray, bool, float]:
         if self._terminated:
             raise RuntimeError("episode is over; call reset() first")
         if not 0 <= action < self.num_actions:
@@ -87,9 +88,11 @@ class EscapeGridEnv:
             self._player = (nr, nc)
 
         self._moves_left -= 1
-        if self._player == self._exit or self._moves_left <= 0:
+        reached_exit = self._player == self._exit
+        if reached_exit or self._moves_left <= 0:
             self._terminated = True
-        return self._render(), self._terminated
+        reward = 1.0 if reached_exit else 0.0
+        return self._render(), self._terminated, reward
 
     # ---- rendering --------------------------------------------------------
 

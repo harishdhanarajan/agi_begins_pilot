@@ -49,7 +49,10 @@ class AgentEnv(Protocol):
     @property
     def num_actions(self) -> int: ...
     def reset(self) -> np.ndarray: ...
-    def step(self, action: int) -> tuple[np.ndarray, bool]: ...
+    def step(self, action: int) -> tuple[np.ndarray, bool, float]: ...
+
+
+Transition = tuple[np.ndarray, int, np.ndarray, float, bool]
 
 
 # ---- 1. data collection -----------------------------------------------------
@@ -58,14 +61,14 @@ def collect_transitions(
     env: AgentEnv,
     num_episodes: int,
     rng: np.random.Generator,
-) -> list[tuple[np.ndarray, int, np.ndarray]]:
-    transitions = []
+) -> list[Transition]:
+    transitions: list[Transition] = []
     for _ in range(num_episodes):
         s = env.reset()
         while True:
             a = int(rng.integers(0, env.num_actions))
-            sp, done = env.step(a)
-            transitions.append((s, a, sp))
+            sp, done, r = env.step(a)
+            transitions.append((s, a, sp, r, done))
             s = sp
             if done:
                 break
@@ -102,9 +105,10 @@ class JEPALearner:
         self.target_encoder = deepcopy(self.encoder)
         for p in self.target_encoder.parameters():
             p.requires_grad_(False)
-        self.opt = torch.optim.Adam(
+        self.opt = torch.optim.AdamW(
             list(self.encoder.parameters()) + list(self.predictor.parameters()),
             lr=lr,
+            weight_decay=1e-4,
         )
         self.ema_decay = ema_decay
 
@@ -141,7 +145,7 @@ class JEPALearner:
 
 def train(
     learner: JEPALearner,
-    transitions: list[tuple[np.ndarray, int, np.ndarray]],
+    transitions: list[Transition],
     num_steps: int = 3000,
     batch_size: int = 64,
     rng: np.random.Generator | None = None,
@@ -172,10 +176,15 @@ def train(
 def probe_convergence(history: list[float], window: int = 200) -> dict:
     if len(history) < window:
         window = max(1, len(history) // 4)
-    start = float(np.mean(history[:window]))
     end = float(np.mean(history[-window:]))
-    ratio = end / max(start, 1e-12)
-    return {"initial_loss": start, "final_loss": end, "shrink_ratio": ratio}
+    minimum = float(min(history))
+    maximum = float(max(history))
+    return {
+        "final_loss": end,
+        "min_loss": minimum,
+        "max_loss": maximum,
+        "stability": end / max(minimum, 1e-12),
+    }
 
 
 def probe_state_count(latents: torch.Tensor) -> dict:
@@ -239,14 +248,14 @@ def probe_manifold_dimension(latents: torch.Tensor, variance_target: float = 0.9
 
 def probe_action_geometry(
     learner: JEPALearner,
-    transitions: list[tuple[np.ndarray, int, np.ndarray]],
+    transitions: list[Transition],
 ) -> dict:
     """For each action, mean latent displacement over transitions where the
     pixel observation actually changed. Cosine similarity between action
     vectors flags inverse pairs (near -1), duplicates (near +1), and
     independent directions (near 0)."""
     by_action: dict[int, list[tuple[np.ndarray, np.ndarray]]] = {a: [] for a in range(learner.num_actions)}
-    for s, a, sp in transitions:
+    for s, a, sp, _r, _done in transitions:
         if s.shape == sp.shape and not np.array_equal(s, sp):
             by_action[a].append((s, sp))
 
@@ -266,10 +275,65 @@ def probe_action_geometry(
     norms = mean_delta.norm(dim=1, keepdim=True).clamp_min(1e-12)
     normed = mean_delta / norms
     cos = (normed @ normed.t()).cpu().numpy().tolist()
+
+    # rank of the action-vector matrix = number of independent directions
+    # the agent can move in latent space = world dimensionality under
+    # translation. uses SVD with a relative tolerance against the largest
+    # singular value, which is robust to overall scaling.
+    sv = torch.linalg.svdvals(mean_delta)
+    rel_tol = 0.05
+    action_rank = int((sv > sv.max() * rel_tol).sum().item()) if sv.numel() else 0
+
+    # count pairs whose cosine is very close to -1.
+    inverse_pairs: list[tuple[int, int]] = []
+    n = mean_delta.shape[0]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if cos[i][j] < -0.85:
+                inverse_pairs.append((i, j))
+
     return {
         "effective_counts": effective_counts,
         "cosine_matrix": cos,
         "mean_delta_norms": mean_delta.norm(dim=1).cpu().numpy().tolist(),
+        "action_rank": action_rank,
+        "inverse_pairs": inverse_pairs,
+        "singular_values": sv.cpu().numpy().tolist(),
+    }
+
+
+def probe_termination(transitions: list[Transition]) -> dict:
+    """Per-episode outcome statistics.
+
+    Splits the flat transition list back into episodes on the `done` flag,
+    then asks: how often did random exploration stumble into a positive-
+    reward terminal state, and how long did it take when it did? This is
+    our first concrete handle on 'is the agent winning?' Random play is
+    the baseline; brick 2 will replace it with novelty-weighted action
+    selection and we expect this number to go up.
+    """
+    episodes: list[list[tuple[float, bool]]] = []
+    current: list[tuple[float, bool]] = []
+    for _s, _a, _sp, r, done in transitions:
+        current.append((r, done))
+        if done:
+            episodes.append(current)
+            current = []
+
+    num_ep = len(episodes)
+    successes = [ep for ep in episodes if any(r > 0 for r, _ in ep)]
+    failures = [ep for ep in episodes if not any(r > 0 for r, _ in ep)]
+
+    success_rate = len(successes) / num_ep if num_ep else 0.0
+    avg_len_success = float(np.mean([len(ep) for ep in successes])) if successes else 0.0
+    avg_len_failure = float(np.mean([len(ep) for ep in failures])) if failures else 0.0
+
+    return {
+        "num_episodes": num_ep,
+        "num_successful": len(successes),
+        "success_rate": success_rate,
+        "avg_steps_to_success": avg_len_success,
+        "avg_steps_to_failure": avg_len_failure,
     }
 
 
@@ -279,7 +343,7 @@ def probe_action_geometry(
 def discover(
     env: AgentEnv,
     num_episodes: int = 300,
-    train_steps: int = 3000,
+    train_steps: int = 5000,
     batch_size: int = 64,
     latent_dim: int = 32,
     seed: int = 0,
@@ -296,7 +360,7 @@ def discover(
     history = train(learner, transitions, num_steps=train_steps, batch_size=batch_size, rng=rng)
 
     seen: dict[bytes, np.ndarray] = {}
-    for s, a, sp in transitions:
+    for s, _a, sp, _r, _done in transitions:
         seen[s.tobytes()] = s
         seen[sp.tobytes()] = sp
     unique_frames = list(seen.values())
@@ -310,45 +374,76 @@ def discover(
         "state_count": probe_state_count(latents),
         "manifold": probe_manifold_dimension(latents),
         "action_geometry": probe_action_geometry(learner, transitions),
+        "termination": probe_termination(transitions),
     }
 
 
 def explain(report: dict) -> str:
     lines: list[str] = []
+
+    t = report["termination"]
+    lines.append(
+        f"outcome: {t['num_successful']}/{t['num_episodes']} episodes successful "
+        f"(success_rate={t['success_rate']:.1%})"
+    )
+    if t["num_successful"] > 0:
+        lines.append(f"  avg steps to success: {t['avg_steps_to_success']:.1f}")
+    if t["num_successful"] < t["num_episodes"]:
+        lines.append(f"  avg steps to failure: {t['avg_steps_to_failure']:.1f}")
+
     conv = report["convergence"]
     lines.append(
-        f"convergence: loss {conv['initial_loss']:.4f} -> {conv['final_loss']:.4f} "
-        f"(shrunk to {conv['shrink_ratio'] * 100:.1f}% of start)"
+        f"convergence: final loss {conv['final_loss']:.5f}  "
+        f"(min {conv['min_loss']:.5f}, max {conv['max_loss']:.5f})"
     )
+
     sc = report["state_count"]
     lines.append(
         f"distinct latent classes: {sc['distinct']}  "
         f"(gap threshold {sc['threshold']:.4f})"
     )
     lines.append(f"unique pixel frames observed: {report['unique_frames_observed']}")
-    m = report["manifold"]
-    lines.append(
-        f"latent manifold: {m['dim_for_variance']}D for {int(m['variance_target'] * 100)}% variance, "
-        f"participation ratio {m['participation_ratio']:.2f}"
-    )
 
     ag = report["action_geometry"]
     norms = ag["mean_delta_norms"]
-    lines.append("action vectors in latent space:")
+    lines.append(
+        f"action rank (independent move directions): {ag['action_rank']}  "
+        f"-- singular values {['%.3f' % s for s in ag['singular_values']]}"
+    )
+    for i, j in ag["inverse_pairs"]:
+        c = ag["cosine_matrix"][i][j]
+        lines.append(f"  actions {i} and {j} are inverses (cos={c:+.2f})")
     for a, norm in enumerate(norms):
         lines.append(
             f"  action {a}: |delta_z|={norm:.3f}, "
             f"effective={ag['effective_counts'][a]} transitions"
         )
-    cos = ag["cosine_matrix"]
-    inverse_threshold = -0.85
-    duplicate_threshold = 0.85
-    n = len(cos)
-    for i in range(n):
-        for j in range(i + 1, n):
-            c = cos[i][j]
-            if c < inverse_threshold:
-                lines.append(f"  actions {i} and {j} look like inverses (cos={c:+.2f})")
-            elif c > duplicate_threshold:
-                lines.append(f"  actions {i} and {j} look like duplicates (cos={c:+.2f})")
+
+    m = report["manifold"]
+    lines.append(
+        f"latent storage: participation ratio {m['participation_ratio']:.2f} "
+        f"(how spread out the encoder packs states; not the world dim)"
+    )
+
+    # generic lattice hypothesis. given an N-D world with K distinct states,
+    # the simplest hypothesis is a regular N-D lattice of side K**(1/N). Use
+    # the directly observed pixel-frame count as the state-count input here;
+    # the encoder cluster count above serves as an audit that the encoder
+    # learned to keep those frames apart.
+    d = ag["action_rank"]
+    k = report["unique_frames_observed"]
+    if d > 0 and k > 1:
+        side = k ** (1.0 / d)
+        side_int = round(side)
+        if side_int >= 2 and abs(side - side_int) < 0.05 and side_int ** d == k:
+            shape = " x ".join([str(side_int)] * d)
+            lines.append(
+                f"==> structural hypothesis: regular {d}D lattice of side {side_int} ({shape})"
+            )
+        else:
+            lines.append(
+                f"==> {d}D structure with {k} states; not a regular lattice"
+            )
+    elif d == 0:
+        lines.append("==> no independent action directions detected")
     return "\n".join(lines)

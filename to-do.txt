@@ -1,0 +1,55 @@
+Yes. I looked it up: the closest existing family is **model-based reinforcement learning + exploration memory**.
+
+The strongest candidates:
+
+1. **DreamerV3**
+   Learns a world model from pixels, then trains behavior by imagining futures. It was designed to work across many domains with one configuration. This is closest to your “learn on the fly” idea.  
+   Source: [DreamerV3 paper](https://arxiv.org/abs/2301.04104)
+
+2. **MuZero**
+   Learns a model for planning without being given the game rules. It predicts only what matters for action: policy, value, reward.  
+   Source: [MuZero paper](https://arxiv.org/abs/1911.08265), [Nature version](https://www.nature.com/articles/s41586-020-03051-4)
+
+3. **Go-Explore**
+   Very relevant for puzzles. Core idea: remember interesting states, return to them, explore from there. Good for sparse-reward / hard-exploration games.  
+   Source: [Go-Explore paper](https://arxiv.org/abs/1901.10995)
+
+4. **ARC / Chollet’s benchmark**
+   This is the benchmark side: tests whether a system can infer new abstract rules from few examples rather than memorization.  
+   Source: [On the Measure of Intelligence](https://arxiv.org/abs/1911.01547)
+
+The honest answer: **no single algorithm fully solves your exact requirement**:
+
+```txt
+no pretraining
+no guidance
+any puzzle
+learn in one hour
+discover rules
+eventually win
+```
+
+But the best blueprint is probably:
+
+```txt
+Dreamer-style world model
++ Go-Explore-style episodic memory
++ MuZero-style planning/search
++ curiosity/novelty objective
+```
+
+For your codebase, the next real direction is:
+
+```txt
+stop asking "what shape is the world?"
+start asking "what action gets me to new/useful states?"
+```
+
+Your current JEPA model is a starting world model. The missing pieces are:
+- novelty-driven exploration
+- memory of visited states
+- return-to-interesting-state behavior
+- success/failure detection
+- planning through learned transitions
+
+That is the road.
