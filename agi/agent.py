@@ -689,6 +689,7 @@ def discover(
     num_cycles: int = 10,
     seed: int = 0,
     watch: bool = False,
+    log_every: int = 0,
 ) -> dict:
     """Closed-loop discovery: alternate collection and training.
 
@@ -715,8 +716,11 @@ def discover(
         # the learner's predictor drives action selection.
         actor = learner if cycle > 0 else None
         mode = "model-biased (novelty + value)" if actor else "uniform random — bootstrap"
-        print(f"[learner] cycle {cycle + 1}/{num_cycles}  collecting {ep_per_cycle} episodes "
-              f"({mode})")
+        print(
+            f"[learner] cycle {cycle + 1}/{num_cycles}  collecting {ep_per_cycle} episodes "
+            f"({mode})",
+            flush=True,
+        )
         chunk = collect_transitions(
             env,
             ep_per_cycle,
@@ -728,15 +732,18 @@ def discover(
         per_cycle_outcomes.append(probe_termination(chunk))
         transitions.extend(chunk)
 
-        print(f"[learner] cycle {cycle + 1}/{num_cycles}  training {steps_per_cycle} steps "
-              f"on {len(transitions)} accumulated transitions")
+        print(
+            f"[learner] cycle {cycle + 1}/{num_cycles}  training {steps_per_cycle} steps "
+            f"on {len(transitions)} accumulated transitions",
+            flush=True,
+        )
         h = train(
             learner,
             transitions,
             num_steps=steps_per_cycle,
             batch_size=batch_size,
             rng=rng,
-            log_every=0,
+            log_every=log_every,
         )
         history.extend(h)
         learner.refresh_buffer()

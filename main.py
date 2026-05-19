@@ -6,8 +6,6 @@ import argparse
 import importlib
 from typing import Any
 
-from agi.agent import discover, explain
-
 
 def load_env_class(spec: str) -> type:
     if ":" not in spec:
@@ -64,6 +62,15 @@ def parse_args() -> argparse.Namespace:
         help="Environment class as module.path:ClassName",
     )
     parser.add_argument("--episodes", type=int, default=300)
+    parser.add_argument("--train-steps", type=int, default=5000)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--cycles", type=int, default=10)
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=0,
+        help="Print training loss every N gradient steps. 0 disables step logs.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--env-seed", type=int, default=0)
     parser.add_argument(
@@ -83,9 +90,22 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    print("[startup] loading learner modules; PyTorch can take a moment...", flush=True)
+    from agi.agent import discover, explain
+    print("[startup] learner loaded", flush=True)
+
     env_class = load_env_class(args.env)
     env = build_env(env_class, seed=args.env_seed, params=parse_env_params(args.env_param))
-    report = discover(env, num_episodes=args.episodes, seed=args.seed, watch=args.watch)
+    report = discover(
+        env,
+        num_episodes=args.episodes,
+        train_steps=args.train_steps,
+        batch_size=args.batch_size,
+        num_cycles=args.cycles,
+        seed=args.seed,
+        watch=args.watch,
+        log_every=args.log_every,
+    )
     print(explain(report))
 
 
