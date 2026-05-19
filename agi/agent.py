@@ -616,27 +616,75 @@ def probe_action_geometry(
     normed = mean_delta / norms
     cos = (normed @ normed.t()).cpu().numpy().tolist()
 
-    # rank of the action-vector matrix = number of independent directions
-    # the agent can move in latent space = world dimensionality under
-    # translation. uses SVD with a relative tolerance against the largest
-    # singular value, which is robust to overall scaling.
+    # Raw rank of the action-vector matrix. This is useful, but stochastic
+    # sampling, terminal states, and no-op transitions can inflate small
+    # singular directions. Keep the raw value for audit, then derive a second
+    # axis count from the learned action-vector angles below.
     sv = torch.linalg.svdvals(mean_delta)
     rel_tol = 0.05
-    action_rank = int((sv > sv.max() * rel_tol).sum().item()) if sv.numel() else 0
+    raw_action_rank = int((sv > sv.max() * rel_tol).sum().item()) if sv.numel() else 0
 
-    # count pairs whose cosine is very close to -1.
-    inverse_pairs: list[tuple[int, int]] = []
     n = mean_delta.shape[0]
+
+    # Count movement axes, treating v and -v as the same axis. This uses only
+    # learned action geometry, not env labels: actions that point along the
+    # same line in latent space are one degree of freedom. The "same line"
+    # cutoff is estimated from the largest gap in pairwise absolute cosine
+    # similarities, so it is learned from the action geometry of this run
+    # instead of being a per-world hint.
+    abs_cos_values: list[float] = []
     for i in range(n):
         for j in range(i + 1, n):
-            if cos[i][j] < -0.85:
+            abs_cos_values.append(abs(float(cos[i][j])))
+    axis_similarity_threshold: float | None = None
+    if len(abs_cos_values) >= 2:
+        sorted_abs = np.sort(np.array(abs_cos_values, dtype=np.float64))
+        gaps = sorted_abs[1:] - sorted_abs[:-1]
+        gap_idx = int(np.argmax(gaps))
+        if gaps[gap_idx] > 1e-9:
+            axis_similarity_threshold = float(
+                (sorted_abs[gap_idx] + sorted_abs[gap_idx + 1]) / 2
+            )
+
+    nonzero_actions = [
+        a for a in range(n) if float(mean_delta[a].norm().item()) >= 1e-12
+    ]
+    inverse_pairs: list[tuple[int, int]] = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if axis_similarity_threshold is not None:
+                if cos[i][j] <= -axis_similarity_threshold:
+                    inverse_pairs.append((i, j))
+            elif (
+                len(nonzero_actions) == 2
+                and raw_action_rank == 1
+                and i in nonzero_actions
+                and j in nonzero_actions
+                and cos[i][j] < 0
+            ):
                 inverse_pairs.append((i, j))
+
+    axis_reps: list[torch.Tensor] = []
+    for a in nonzero_actions:
+        norm = mean_delta[a].norm()
+        direction = mean_delta[a] / norm
+        if axis_similarity_threshold is not None and any(
+            abs(float(direction @ rep)) >= axis_similarity_threshold
+            for rep in axis_reps
+        ):
+            continue
+        axis_reps.append(direction)
+    signed_axis_count = len(axis_reps)
+    action_rank = min(raw_action_rank, signed_axis_count) if signed_axis_count else raw_action_rank
 
     return {
         "effective_counts": effective_counts,
         "cosine_matrix": cos,
         "mean_delta_norms": mean_delta.norm(dim=1).cpu().numpy().tolist(),
         "action_rank": action_rank,
+        "raw_action_rank": raw_action_rank,
+        "signed_axis_count": signed_axis_count,
+        "axis_similarity_threshold": axis_similarity_threshold,
         "inverse_pairs": inverse_pairs,
         "singular_values": sv.cpu().numpy().tolist(),
     }
@@ -846,6 +894,17 @@ def explain(report: dict) -> str:
         f"action rank (independent move directions): {ag['action_rank']}  "
         f"-- singular values {['%.3f' % s for s in ag['singular_values']]}"
     )
+    if ag.get("raw_action_rank") != ag.get("action_rank"):
+        threshold = ag.get("axis_similarity_threshold")
+        threshold_text = (
+            f", angle-gap threshold {threshold:.2f}"
+            if threshold is not None
+            else ""
+        )
+        lines.append(
+            f"  raw SVD rank {ag['raw_action_rank']} compressed to "
+            f"{ag['signed_axis_count']} signed movement axes{threshold_text}"
+        )
     for i, j in ag["inverse_pairs"]:
         c = ag["cosine_matrix"][i][j]
         lines.append(f"  actions {i} and {j} are inverses (cos={c:+.2f})")
