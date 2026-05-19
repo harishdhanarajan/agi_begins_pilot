@@ -1,59 +1,46 @@
-"""Learner-only agent.
+"""DreamerV3-architecture agent: orchestration layer.
 
-The agent is given only:
-  * env.num_actions  — count of opaque action handles
-  * env.reset() / env.step(a) — the two primitives of life
+The neural pieces live in ``model.py``, ``world_model.py``, and
+``actor_critic.py``. This file is the glue that:
 
-It is never told the world is a grid, that frames are 2D, or what an action
-means. Discovery happens via *learning*:
+  * keeps a running posterior state ``(h, z)`` across an episode so the agent
+    can ``act`` one step at a time;
+  * pushes finished episodes into the sequence replay;
+  * runs one gradient step on the world model and one on the actor-critic
+    per ``train_step`` call;
+  * exposes ``discover(env)`` and ``explain(report)`` so the CLI in
+    ``main.py`` stays one-line on top.
 
-  1. Act randomly. Record (frame_t, action, frame_{t+1}) transitions.
-  2. Train a JEPA-style world model:
-        z_t   = encoder(frame_t)
-        z_t+1 = target_encoder(frame_{t+1})              [no gradient]
-        z_hat = predictor(z_t, action_one_hot)
-        loss  = ||z_hat - z_t+1||^2
-     target_encoder is an exponential moving average of encoder. This
-     prevents the trivial collapse of mapping everything to a constant.
-  3. Probe the trained model for emergent structure. Probes are
-     world-agnostic: they only ask geometric questions of the latent space.
-       * convergence — did the model fit the dynamics?
-       * state count — how many latent equivalence classes did the encoder
-         carve out (gap-based clustering, no priors on count or shape).
-       * manifold dimension — PCA on observed latents; how many components
-         carry 95% of the variance.
-       * action geometry — mean shift per action in latent space; cosine
-         similarity reveals inverse-vector pairs.
-
-The probes never name a topology. They report primitives; interpretation
-('this is an 8x8 grid') is downstream cognition, not part of the learner.
-This keeps the agent the same code for *any* world it is dropped into.
+Everything is env-agnostic: the only thing the agent reads from ``env`` is
+``reset()``, ``step(action)``, and ``num_actions``. Image shape is inferred
+from the first observation; nothing is hardcoded.
 """
 
 from __future__ import annotations
 
 import time
-from copy import deepcopy
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-from .model import Encoder, Predictor, ValueHead
+from .actor_critic import ActorCritic
+from .nets import frames_to_tensor, one_hot
+from .probes import (
+    probe_action_geometry,
+    probe_convergence,
+    probe_manifold_dimension,
+    probe_state_count,
+    probe_termination,
+)
+from .replay import SequenceReplay
+from .world_model import WorldModel, WorldModelConfig
 
 
-# ---- VIZ (brick-2 helper; remove this block + the `watch` plumbing to retire) ----
-#
-# Renders a pixel frame as an ASCII grid for a human watching the agent play.
-# The agent never sees this output; it's purely for the observer. The renderer
-# is env-agnostic: it detects tile size from the frame itself and assigns one
-# character per unique color, sorted by brightness.
+# ---- viz (observer only; does not affect agent behavior) -------------------
 
 def _detect_tile_size(frame: np.ndarray) -> int:
-    """Smallest run of identical pixels in the middle row — works for any env
-    that paints uniform-colored tiles, regardless of tile_pixels setting."""
     row = frame[frame.shape[0] // 2]
     min_run = frame.shape[1]
     run = 1
@@ -70,28 +57,23 @@ def _detect_tile_size(frame: np.ndarray) -> int:
 def _frame_to_ascii(frame: np.ndarray) -> str:
     tile = _detect_tile_size(frame)
     h, w, _ = frame.shape
-    # one char per unique color, ordered dark -> bright
     unique = sorted({tuple(c.tolist()) for c in frame.reshape(-1, 3)}, key=sum)
     palette = " .oO@#*+"
     color_char = {c: palette[min(i, len(palette) - 1)] for i, c in enumerate(unique)}
     lines = []
     for r in range(tile // 2, h, tile):
-        row = "".join(color_char[tuple(frame[r, c].tolist())] for c in range(tile // 2, w, tile))
-        lines.append(row)
+        row_chars = "".join(color_char[tuple(frame[r, c].tolist())] for c in range(tile // 2, w, tile))
+        lines.append(row_chars)
     return "\n".join(lines)
 
 
 def _render_step(frame: np.ndarray, header: str) -> None:
-    # clear screen + home cursor (ANSI; works in modern Windows Terminal / PS).
     print("\033[2J\033[H", end="")
     print(header)
     print(_frame_to_ascii(frame))
 
 
-# ---- END VIZ ----
-
-
-# ---- 0. interfaces ----------------------------------------------------------
+# ---- env interface ---------------------------------------------------------
 
 class AgentEnv(Protocol):
     @property
@@ -100,734 +82,327 @@ class AgentEnv(Protocol):
     def step(self, action: int) -> tuple[np.ndarray, bool, float]: ...
 
 
-Transition = tuple[np.ndarray, int, np.ndarray, float, bool]
+# ---- agent -----------------------------------------------------------------
 
+class DreamerAgent:
+    """Drives the world model and actor-critic from outside.
 
-# ---- 1. data collection -----------------------------------------------------
-
-def collect_transitions(
-    env: AgentEnv,
-    num_episodes: int,
-    rng: np.random.Generator,
-    learner: "JEPALearner | None" = None,
-    watch: bool = False,
-    watch_label: str = "",
-) -> list[Transition]:
-    """Collect transitions for `num_episodes` episodes.
-
-    If `learner` is provided, actions are chosen by `learner.select_action`
-    (novelty-biased). Otherwise actions are uniform random — that path is
-    the bootstrap used in the very first cycle of `discover`, before the
-    learner has any useful predictor.
-
-    Every observed frame is registered with the learner's buffer so the next
-    cycle's action selection has more to compare against.
+    Holds three optimizers — one for the world model parameters, one for the
+    actor, one for the critic. Each ``train_step`` does:
+      1. world-model loss on a sampled batch; gradient step.
+      2. imagine ``horizon`` steps from the posterior states the world model
+         just produced; actor-critic loss on the imagined trajectory; gradient
+         steps.
+      3. EMA update of the slow target critic.
     """
-    transitions: list[Transition] = []
-    for ep in range(num_episodes):
-        s = env.reset()
-        if learner is not None:
-            learner.observe(s)
-        if watch:
-            _render_step(s, f"{watch_label}  ep {ep + 1}/{num_episodes}  step 0  (reset)")
-            time.sleep(0.08)
-        ep_start = len(transitions)
-        step_idx = 0
-        while True:
-            if learner is not None:
-                a = learner.select_action(s, rng)
-            else:
-                a = int(rng.integers(0, env.num_actions))
-            sp, done, r = env.step(a)
-            transitions.append((s, a, sp, r, done))
-            if learner is not None:
-                learner.observe(sp)
-            step_idx += 1
-            if watch:
-                tag = " WIN" if r > 0 else (" timeout" if done else "")
-                _render_step(
-                    sp,
-                    f"{watch_label}  ep {ep + 1}/{num_episodes}  step {step_idx}  "
-                    f"action={a}  reward={r}{tag}",
-                )
-                time.sleep(0.08)
-            s = sp
-            if done:
-                break
-        if learner is not None:
-            learner.record_episode(transitions[ep_start:])
-    return transitions
 
-
-def _frames_to_tensor(frames: list[np.ndarray]) -> torch.Tensor:
-    arr = np.stack(frames).astype(np.float32) / 255.0
-    arr = np.transpose(arr, (0, 3, 1, 2))
-    return torch.from_numpy(arr)
-
-
-def _one_hot(actions: list[int], num_actions: int) -> torch.Tensor:
-    out = torch.zeros(len(actions), num_actions)
-    for i, a in enumerate(actions):
-        out[i, a] = 1.0
-    return out
-
-
-def _scale_invariant(x: np.ndarray) -> np.ndarray:
-    """Center and divide by std. Returns zeros when all entries are equal —
-    the signal carries no information about which action is better, so its
-    softmax contribution should be flat."""
-    s = float(x.std())
-    if s < 1e-9:
-        return np.zeros_like(x)
-    return (x - x.mean()) / s
-
-
-# ---- 2. learner -------------------------------------------------------------
-
-class JEPALearner:
     def __init__(
         self,
         num_actions: int,
-        latent_dim: int = 32,
-        lr: float = 1e-3,
-        ema_decay: float = 0.99,
-        max_success_trajectories: int = 64,
+        image_shape: tuple[int, int, int],
+        seq_len: int = 16,
+        imag_horizon: int = 8,
+        batch_size: int = 16,
+        wm_lr: float = 1e-4,
+        actor_lr: float = 3e-5,
+        critic_lr: float = 3e-5,
+        clip_grad: float = 1.0,
+        device: str = "cpu",
     ) -> None:
+        self.device = torch.device(device)
         self.num_actions = num_actions
-        self.latent_dim = latent_dim
-        self.encoder = Encoder(latent_dim=latent_dim)
-        self.predictor = Predictor(latent_dim=latent_dim, num_actions=num_actions)
-        self.target_encoder = deepcopy(self.encoder)
-        for p in self.target_encoder.parameters():
-            p.requires_grad_(False)
-        self.opt = torch.optim.AdamW(
-            list(self.encoder.parameters()) + list(self.predictor.parameters()),
-            lr=lr,
-            weight_decay=1e-4,
-        )
-        self.ema_decay = ema_decay
+        self.image_shape = image_shape
+        self.seq_len = seq_len
+        self.imag_horizon = imag_horizon
+        self.batch_size = batch_size
+        self.clip_grad = clip_grad
 
-        # value head: separate module, separate optimizer, so its gradient
-        # never touches the encoder or predictor params. The encoder's only
-        # job stays JEPA latent prediction; value bootstrapping happens on
-        # detached latents.
-        self.value_head = ValueHead(latent_dim=latent_dim)
-        self.value_opt = torch.optim.AdamW(
-            self.value_head.parameters(), lr=lr, weight_decay=1e-4
-        )
+        cfg = WorldModelConfig(num_actions=num_actions, image_shape=image_shape)
+        self.cfg = cfg
+        self.world_model = WorldModel(cfg).to(self.device)
+        self.world_model.twohot.to(self.device)
 
-        # novelty buffer: deduped seen frames (by raw pixels) and a cached
-        # tensor of their target-encoder embeddings. select_action compares
-        # the predictor's ẑ_next against this buffer; the action whose
-        # predicted next-latent is farthest from anything already seen wins.
-        self._seen_pixels: set[bytes] = set()
-        self._seen_frames: list[np.ndarray] = []
-        self._buffer_z: torch.Tensor | None = None
-        # encoder's own learned "same vs different state" distance, derived
-        # from the buffer's pairwise spectrum (same gap-clustering algorithm
-        # as probe_state_count). Used by the success-memory match to decide
-        # whether the current frame counts as the same state as a stored one.
-        self._buffer_match_threshold: float = 0.0
+        stoch_flat = cfg.stoch_groups * cfg.stoch_classes
+        self.ac = ActorCritic(
+            num_actions=num_actions,
+            deter_dim=cfg.deter_dim,
+            stoch_flat=stoch_flat,
+            twohot=self.world_model.twohot,
+            hidden=cfg.hidden,
+        ).to(self.device)
 
-        # running mean of predicted value during training. Surfaced in
-        # explain() so we can tell at a glance whether the value head is
-        # learning anything (stays near zero on unrewarded envs, rises on
-        # rewarded ones once Bellman backpropagation kicks in).
-        self._v_pred_sum: float = 0.0
-        self._v_pred_n: int = 0
+        self.wm_opt = torch.optim.AdamW(self.world_model.parameters(), lr=wm_lr, eps=1e-8, weight_decay=0.0)
+        self.actor_opt = torch.optim.AdamW(self.ac.actor.parameters(), lr=actor_lr, eps=1e-8, weight_decay=0.0)
+        self.critic_opt = torch.optim.AdamW(self.ac.critic.parameters(), lr=critic_lr, eps=1e-8, weight_decay=0.0)
 
-        # episodic success memory (this-run-only; resets when a new learner
-        # is constructed, which happens once per program invocation). Stores
-        # prefixes of episodes that hit reward > 0, so future visits to the
-        # same state can bias toward the action that worked. Curated to the
-        # K shortest trajectories — a "best/shortest known paths" prior.
-        self.max_success_trajectories = max_success_trajectories
-        self._success_memory: list[list[tuple[np.ndarray, int]]] = []
-        # flattened, re-encoded view of the memory for fast NN lookup.
-        # Rebuilt each cycle so it lives in the current latent space.
-        self._success_states_z: torch.Tensor | None = None
-        self._success_actions: list[int] = []
-        self._success_remaining: list[int] = []
-        self._best_success_len: int | None = None
-        # diagnostics: how often did the match condition fire?
-        self._mem_hits: int = 0
-        self._mem_queries: int = 0
+        # running state used by ``act`` to maintain (h, z) across an episode
+        self._h: torch.Tensor | None = None
+        self._z: torch.Tensor | None = None
+        self._prev_action_onehot: torch.Tensor | None = None
 
-    def train_step(
-        self,
-        frames_t: torch.Tensor,
-        actions: list[int],
-        frames_tp1: torch.Tensor,
-        rewards: torch.Tensor,
-        dones: torch.Tensor,
-    ) -> float:
-        # --- JEPA latent loss (unchanged from brick 2) ---
-        z_t = self.encoder(frames_t)
-        with torch.no_grad():
-            z_target = self.target_encoder(frames_tp1)
-        a_oh = _one_hot(actions, self.num_actions)
-        z_pred = self.predictor(z_t, a_oh)
-        loss = F.mse_loss(z_pred, z_target)
+        # diagnostics accumulators (for the report; do not influence behavior)
+        self._wm_loss_history: list[float] = []
+        self._actor_info_last: dict[str, float] = {}
+        self._critic_info_last: dict[str, float] = {}
+        self._imagined_returns: list[float] = []
+        self._train_steps_taken = 0
 
-        self.opt.zero_grad()
-        loss.backward()
-        self.opt.step()
+    # ---- per-episode acting ----
 
-        with torch.no_grad():
-            for tp, p in zip(self.target_encoder.parameters(), self.encoder.parameters()):
-                tp.data.mul_(self.ema_decay).add_(p.data, alpha=1 - self.ema_decay)
-
-        # --- TD(0) value bootstrap (separate path, encoder shielded) ---
-        # Both latents are computed inside no_grad, so the value loss can
-        # only flow into value_head params — never into encoder or predictor.
-        # Target = reward + (1 - done) * V(s'); undiscounted because episodes
-        # terminate, so no magic gamma.
-        with torch.no_grad():
-            z_now = self.encoder(frames_t)
-            z_next = self.encoder(frames_tp1)
-            v_next = self.value_head(z_next)
-            target_v = rewards + (1.0 - dones) * v_next
-        v_pred = self.value_head(z_now)
-        value_loss = F.mse_loss(v_pred, target_v)
-        self.value_opt.zero_grad()
-        value_loss.backward()
-        self.value_opt.step()
-
-        with torch.no_grad():
-            self._v_pred_sum += float(v_pred.mean().item())
-            self._v_pred_n += 1
-
-        return float(loss.item())
+    def reset_state(self) -> None:
+        h, z = self.world_model.rssm.initial(1, self.device)
+        self._h = h
+        self._z = z
+        self._prev_action_onehot = torch.zeros(1, self.num_actions, device=self.device)
 
     @torch.no_grad()
-    def encode(self, frames: list[np.ndarray]) -> torch.Tensor:
-        self.encoder.eval()
-        out = self.encoder(_frames_to_tensor(frames))
-        self.encoder.train()
+    def act(self, obs: np.ndarray, rng: np.random.Generator, greedy: bool = False) -> int:
+        """One-step posterior + action sample.
+
+        Maintains ``self._h, self._z`` across calls within an episode. Always
+        call ``reset_state()`` at the start of each episode.
+        """
+        assert self._h is not None and self._z is not None and self._prev_action_onehot is not None
+        x = frames_to_tensor([obs]).to(self.device)
+        x_emb = self.world_model.encoder(x)
+        h, _ = self.world_model.rssm.img_step(self._h, self._z, self._prev_action_onehot)
+        _, z = self.world_model.rssm.obs_step(h, x_emb)
+        self._h = h
+        self._z = z
+
+        z_flat = z.reshape(1, -1)
+        actor_logits = self.ac.actor(h, z_flat)
+        if greedy:
+            a_idx = int(actor_logits.argmax(dim=-1).item())
+        else:
+            probs = F.softmax(actor_logits, dim=-1)
+            # numpy categorical sample — keeps RNG explicit + reproducible
+            p = probs.detach().cpu().numpy().reshape(-1)
+            p = p / p.sum()
+            a_idx = int(rng.choice(self.num_actions, p=p))
+        self._prev_action_onehot = one_hot([a_idx], self.num_actions).to(self.device)
+        return a_idx
+
+    # ---- training ----
+
+    def train_step(self, replay: SequenceReplay, rng: np.random.Generator) -> dict[str, float]:
+        if not replay.ready(self.batch_size):
+            return {}
+
+        np_batch = replay.sample(self.batch_size, self.seq_len, rng)
+        batch = {
+            # frames_to_tensor handles leading (B, T) dims and moves the
+            # channel axis from -1 to -3, so we get (B, T, 3, H, W) directly.
+            "obs": frames_to_tensor(np_batch["obs"]).to(self.device),
+            "action": torch.from_numpy(np_batch["action"]).to(self.device),
+            "reward": torch.from_numpy(np_batch["reward"]).to(self.device),
+            "cont": torch.from_numpy(np_batch["cont"]).to(self.device),
+            "first": torch.from_numpy(np_batch["first"]).to(self.device),
+        }
+
+        # ---- world model update ----
+        wm_loss, wm_info, states = self.world_model.loss(batch)
+        self.wm_opt.zero_grad(set_to_none=True)
+        wm_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), self.clip_grad)
+        self.wm_opt.step()
+        self._wm_loss_history.append(wm_info["wm/total"])
+
+        # ---- imagine + actor-critic update ----
+        h = states["h"].detach()
+        z = states["z"].detach()
+        B, T = h.shape[:2]
+        start_h = h.reshape(B * T, -1)
+        start_z = z.reshape(B * T, *z.shape[2:])
+
+        traj = self.world_model.imagine(start_h, start_z, self.ac.actor, self.imag_horizon)
+
+        actor_loss, actor_info, returns = self.ac.actor_loss(traj)
+        self.actor_opt.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.ac.actor.parameters(), self.clip_grad)
+        self.actor_opt.step()
+
+        critic_loss, critic_info = self.ac.critic_loss(traj, returns)
+        self.critic_opt.zero_grad(set_to_none=True)
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.ac.critic.parameters(), self.clip_grad)
+        self.critic_opt.step()
+
+        self.ac.update_target()
+
+        self._actor_info_last = actor_info
+        self._critic_info_last = critic_info
+        self._imagined_returns.append(float(returns.mean().item()))
+        self._train_steps_taken += 1
+
+        out: dict[str, float] = {}
+        out.update(wm_info)
+        out.update(actor_info)
+        out.update(critic_info)
         return out
 
-    # ---- novelty buffer ----
 
-    def observe(self, frame: np.ndarray) -> None:
-        """Register a frame as 'seen'. Dedup is by raw pixels, so a finite
-        world has a finite buffer no matter how many transitions we collect."""
-        h = frame.tobytes()
-        if h in self._seen_pixels:
-            return
-        self._seen_pixels.add(h)
-        self._seen_frames.append(frame)
+# ---- top-level loop --------------------------------------------------------
 
-    @torch.no_grad()
-    def refresh_buffer(self) -> None:
-        """Re-encode the seen frames with the current target encoder. Call this
-        between training chunks so novelty distances reflect the latest model.
+def collect_episode(
+    env: AgentEnv,
+    agent: DreamerAgent,
+    rng: np.random.Generator,
+    replay: SequenceReplay,
+    watch: bool = False,
+    watch_label: str = "",
+    greedy: bool = False,
+) -> tuple[list[tuple[np.ndarray, int, float, bool]], list[tuple[float, bool]]]:
+    """Run one episode and push it into the replay.
 
-        Also recomputes `_buffer_match_threshold` — the encoder's own learned
-        "same vs different state" distance, found by the gap-clustering
-        algorithm probe_state_count uses. Cached here so select_action can
-        decide success-memory matches without recomputing pairwise distances
-        on every step.
-        """
-        if not self._seen_frames:
-            self._buffer_z = None
-            self._buffer_match_threshold = 0.0
-            return
-        self.target_encoder.eval()
-        self._buffer_z = self.target_encoder(_frames_to_tensor(self._seen_frames))
-
-        n = self._buffer_z.shape[0]
-        if n < 2:
-            self._buffer_match_threshold = 0.0
-            return
-        d = torch.cdist(self._buffer_z, self._buffer_z)
-        iu = torch.triu_indices(n, n, offset=1)
-        pairwise = d[iu[0], iu[1]].cpu().numpy()
-        sorted_pos = np.sort(pairwise[pairwise > 1e-6])
-        if len(sorted_pos) < 2:
-            self._buffer_match_threshold = 0.0
-            return
-        ratios = sorted_pos[1:] / np.maximum(sorted_pos[:-1], 1e-12)
-        cut_idx = int(np.argmax(ratios))
-        self._buffer_match_threshold = float(
-            (sorted_pos[cut_idx] + sorted_pos[cut_idx + 1]) / 2
-        )
-
-    # ---- success memory ----
-
-    def record_episode(self, episode: list[Transition]) -> None:
-        """If the episode hit reward > 0, store the prefix (states + actions)
-        leading up to and including the rewarding step. Curated to the K
-        shortest trajectories — longer paths are dropped when full, so the
-        memory always reflects the best known ways to win.
-
-        Only the first reward in the episode is anchored, so trajectories
-        terminate at the first positive outcome rather than running on past
-        it. Works on any env: when no episode ever sees reward > 0 (e.g.
-        CycleEnv, RaggedGridEnv), nothing is stored and memory stays empty.
-        """
-        for i, (_s, _a, _sp, r, _done) in enumerate(episode):
-            if r > 0:
-                trajectory = [(step[0], step[1]) for step in episode[: i + 1]]
-                traj_len = len(trajectory)
-                if self._best_success_len is None or traj_len < self._best_success_len:
-                    self._best_success_len = traj_len
-                self._success_memory.append(trajectory)
-                if len(self._success_memory) > self.max_success_trajectories:
-                    self._success_memory.sort(key=len)
-                    self._success_memory = self._success_memory[
-                        : self.max_success_trajectories
-                    ]
-                return
-
-    @torch.no_grad()
-    def refresh_success_index(self) -> None:
-        """Re-encode the success memory under the current target encoder so
-        the nearest-neighbor lookup in select_action lives in the latest
-        latent space. Maintains parallel arrays so a single NN query returns
-        both the recommended action and the steps-remaining-to-goal at that
-        point in its parent trajectory (used as a tiebreaker among matches:
-        prefer the shorter known path forward).
-        """
-        if not self._success_memory:
-            self._success_states_z = None
-            self._success_actions = []
-            self._success_remaining = []
-            return
-        flat_frames: list[np.ndarray] = []
-        self._success_actions = []
-        self._success_remaining = []
-        for traj in self._success_memory:
-            L = len(traj)
-            for i, (frame, action) in enumerate(traj):
-                flat_frames.append(frame)
-                self._success_actions.append(action)
-                self._success_remaining.append(L - i)
-        self.target_encoder.eval()
-        self._success_states_z = self.target_encoder(_frames_to_tensor(flat_frames))
-
-    @torch.no_grad()
-    def select_action(
-        self,
-        frame: np.ndarray,
-        rng: np.random.Generator,
-    ) -> int:
-        """Pick an action biased toward predicted-novel AND predicted-valuable
-        next states, with an extra bias toward replaying actions that worked
-        from this state in past successful episodes.
-
-        For each candidate action a:
-            z_hat = predictor(z, a)                  # imagined next latent
-            novelty[a] = min distance from z_hat to the seen-frames buffer
-            value[a]   = value_head(z_hat)           # expected future return
-
-        Memory bias: encode the current frame with the target encoder, look
-        it up against the flattened success memory; if the nearest stored
-        state is within the encoder's own learned "same state" threshold
-        (`_buffer_match_threshold`), put a 1.0 on the action that was taken
-        there. Ties broken by smallest remaining-steps-to-goal — the
-        "shortest known path forward" prior. When no match exists, no
-        successes have been recorded yet, or the env has no reward at all,
-        memory_bias stays zero and behavior reduces to novelty + value.
-
-        All three signals are standardized (center, divide by std) so none
-        dominates by absolute scale, then summed and softmaxed — exploration
-        stays alive because the bias is a one-hot, not a hard override.
-
-        Falls back to uniform random when the buffer has fewer entries than
-        the action count — not enough data to compare actions yet.
-        """
-        if self._buffer_z is None or self._buffer_z.shape[0] < self.num_actions:
-            return int(rng.integers(0, self.num_actions))
-
-        self.encoder.eval()
-        z = self.encoder(_frames_to_tensor([frame]))
-        self.encoder.train()
-
-        novelty = np.zeros(self.num_actions, dtype=np.float64)
-        value = np.zeros(self.num_actions, dtype=np.float64)
-        for a in range(self.num_actions):
-            a_oh = _one_hot([a], self.num_actions)
-            z_hat = self.predictor(z, a_oh)
-            novelty[a] = float(torch.cdist(z_hat, self._buffer_z).min().item())
-            value[a] = float(self.value_head(z_hat).item())
-
-        memory_bias = np.zeros(self.num_actions, dtype=np.float64)
-        self._mem_queries += 1
-        if (
-            self._success_states_z is not None
-            and self._buffer_match_threshold > 0.0
-        ):
-            self.target_encoder.eval()
-            z_target = self.target_encoder(_frames_to_tensor([frame]))
-            dists = torch.cdist(z_target, self._success_states_z)[0]
-            within = (dists < self._buffer_match_threshold).nonzero().flatten()
-            if within.numel() > 0:
-                remaining = np.array(
-                    [self._success_remaining[int(i)] for i in within]
-                )
-                best = int(within[int(np.argmin(remaining))].item())
-                memory_bias[self._success_actions[best]] = 1.0
-                self._mem_hits += 1
-
-        score = (
-            _scale_invariant(novelty)
-            + _scale_invariant(value)
-            + _scale_invariant(memory_bias)
-        )
-        if not np.any(score):
-            return int(rng.integers(0, self.num_actions))
-        e = np.exp(score - score.max())
-        probs = e / e.sum()
-        return int(rng.choice(self.num_actions, p=probs))
-
-
-def train(
-    learner: JEPALearner,
-    transitions: list[Transition],
-    num_steps: int = 3000,
-    batch_size: int = 64,
-    rng: np.random.Generator | None = None,
-    log_every: int = 500,
-) -> list[float]:
-    rng = rng if rng is not None else np.random.default_rng(0)
-    n = len(transitions)
-    history: list[float] = []
-    for step in range(num_steps):
-        idx = rng.integers(0, n, size=batch_size)
-        batch = [transitions[i] for i in idx]
-        frames_t = _frames_to_tensor([t[0] for t in batch])
-        actions = [t[1] for t in batch]
-        frames_tp1 = _frames_to_tensor([t[2] for t in batch])
-        rewards = torch.tensor([float(t[3]) for t in batch], dtype=torch.float32)
-        dones = torch.tensor([float(t[4]) for t in batch], dtype=torch.float32)
-        loss = learner.train_step(frames_t, actions, frames_tp1, rewards, dones)
-        history.append(loss)
-        if log_every and (step + 1) % log_every == 0:
-            print(f"  step {step + 1:>5}/{num_steps}  loss={loss:.5f}")
-    return history
-
-
-# ---- 3. probes --------------------------------------------------------------
-#
-# Each probe asks a single geometric question of the trained latent space.
-# None of them know what the world is.
-
-
-def probe_convergence(history: list[float], window: int = 200) -> dict:
-    if len(history) < window:
-        window = max(1, len(history) // 4)
-    end = float(np.mean(history[-window:]))
-    minimum = float(min(history))
-    maximum = float(max(history))
-    return {
-        "final_loss": end,
-        "min_loss": minimum,
-        "max_loss": maximum,
-        "stability": end / max(minimum, 1e-12),
-    }
-
-
-def probe_state_count(latents: torch.Tensor) -> dict:
-    """Count distinct latent equivalence classes via a gap criterion on the
-    sorted pairwise distance distribution.
-
-    Intuition: if the encoder learned to separate the world's states,
-    intra-class distances are near zero and inter-class distances are
-    bounded away from zero. The largest *relative* gap in the sorted
-    positive distance list separates 'same' from 'different'. Union-find
-    over distances under that threshold yields the cluster count. No
-    built-in expected count or shape.
+    Returns the raw episode tuples and a (reward, done) trace used by the
+    termination probe.
     """
-    n = latents.shape[0]
-    if n <= 1:
-        return {"distinct": n, "threshold": 0.0}
-    d = torch.cdist(latents, latents)
-    iu = torch.triu_indices(n, n, offset=1)
-    pairwise = d[iu[0], iu[1]].cpu().numpy()
-
-    sorted_pos = np.sort(pairwise[pairwise > 1e-6])
-    if len(sorted_pos) < 2:
-        return {"distinct": 1, "threshold": 0.0}
-    ratios = sorted_pos[1:] / np.maximum(sorted_pos[:-1], 1e-12)
-    cut_idx = int(np.argmax(ratios))
-    threshold = float((sorted_pos[cut_idx] + sorted_pos[cut_idx + 1]) / 2)
-
-    parent = list(range(n))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    d_np = d.cpu().numpy()
-    for i in range(n):
-        for j in range(i + 1, n):
-            if d_np[i, j] < threshold:
-                ri, rj = find(i), find(j)
-                if ri != rj:
-                    parent[ri] = rj
-    distinct = len({find(i) for i in range(n)})
-    return {"distinct": distinct, "threshold": threshold}
-
-
-def probe_manifold_dimension(latents: torch.Tensor, variance_target: float = 0.95) -> dict:
-    z = latents - latents.mean(dim=0, keepdim=True)
-    sv = torch.linalg.svdvals(z)
-    var = sv.pow(2)
-    cumulative = torch.cumsum(var, dim=0) / var.sum().clamp_min(1e-12)
-    dim = int((cumulative < variance_target).sum().item()) + 1
-    participation = (var.sum() ** 2) / (var.pow(2).sum().clamp_min(1e-12))
-    return {
-        "dim_for_variance": dim,
-        "participation_ratio": float(participation.item()),
-        "variance_target": variance_target,
-        "spectrum": var.cpu().numpy().tolist(),
-    }
-
-
-def probe_action_geometry(
-    learner: JEPALearner,
-    transitions: list[Transition],
-) -> dict:
-    """For each action, mean latent displacement over transitions where the
-    pixel observation actually changed. Cosine similarity between action
-    vectors flags inverse pairs (near -1), duplicates (near +1), and
-    independent directions (near 0)."""
-    by_action: dict[int, list[tuple[np.ndarray, np.ndarray]]] = {a: [] for a in range(learner.num_actions)}
-    for s, a, sp, _r, _done in transitions:
-        if s.shape == sp.shape and not np.array_equal(s, sp):
-            by_action[a].append((s, sp))
-
-    mean_delta = torch.zeros(learner.num_actions, learner.latent_dim)
-    effective_counts: dict[int, int] = {}
-    for a, samples in by_action.items():
-        effective_counts[a] = len(samples)
-        if not samples:
-            continue
-        frames_t = _frames_to_tensor([x[0] for x in samples])
-        frames_tp1 = _frames_to_tensor([x[1] for x in samples])
-        with torch.no_grad():
-            z_t = learner.encoder(frames_t)
-            z_tp1 = learner.encoder(frames_tp1)
-        mean_delta[a] = (z_tp1 - z_t).mean(dim=0)
-
-    norms = mean_delta.norm(dim=1, keepdim=True).clamp_min(1e-12)
-    normed = mean_delta / norms
-    cos = (normed @ normed.t()).cpu().numpy().tolist()
-
-    # Raw rank of the action-vector matrix. This is useful, but stochastic
-    # sampling, terminal states, and no-op transitions can inflate small
-    # singular directions. Keep the raw value for audit, then derive a second
-    # axis count from the learned action-vector angles below.
-    sv = torch.linalg.svdvals(mean_delta)
-    rel_tol = 0.05
-    raw_action_rank = int((sv > sv.max() * rel_tol).sum().item()) if sv.numel() else 0
-
-    n = mean_delta.shape[0]
-
-    # Count movement axes, treating v and -v as the same axis. This uses only
-    # learned action geometry, not env labels: actions that point along the
-    # same line in latent space are one degree of freedom. The "same line"
-    # cutoff is estimated from the largest gap in pairwise absolute cosine
-    # similarities, so it is learned from the action geometry of this run
-    # instead of being a per-world hint.
-    abs_cos_values: list[float] = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            abs_cos_values.append(abs(float(cos[i][j])))
-    axis_similarity_threshold: float | None = None
-    if len(abs_cos_values) >= 2:
-        sorted_abs = np.sort(np.array(abs_cos_values, dtype=np.float64))
-        gaps = sorted_abs[1:] - sorted_abs[:-1]
-        gap_idx = int(np.argmax(gaps))
-        if gaps[gap_idx] > 1e-9:
-            axis_similarity_threshold = float(
-                (sorted_abs[gap_idx] + sorted_abs[gap_idx + 1]) / 2
-            )
-
-    nonzero_actions = [
-        a for a in range(n) if float(mean_delta[a].norm().item()) >= 1e-12
-    ]
-    inverse_pairs: list[tuple[int, int]] = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            if axis_similarity_threshold is not None:
-                if cos[i][j] <= -axis_similarity_threshold:
-                    inverse_pairs.append((i, j))
-            elif (
-                len(nonzero_actions) == 2
-                and raw_action_rank == 1
-                and i in nonzero_actions
-                and j in nonzero_actions
-                and cos[i][j] < 0
-            ):
-                inverse_pairs.append((i, j))
-
-    axis_reps: list[torch.Tensor] = []
-    for a in nonzero_actions:
-        norm = mean_delta[a].norm()
-        direction = mean_delta[a] / norm
-        if axis_similarity_threshold is not None and any(
-            abs(float(direction @ rep)) >= axis_similarity_threshold
-            for rep in axis_reps
-        ):
-            continue
-        axis_reps.append(direction)
-    signed_axis_count = len(axis_reps)
-    action_rank = min(raw_action_rank, signed_axis_count) if signed_axis_count else raw_action_rank
-
-    return {
-        "effective_counts": effective_counts,
-        "cosine_matrix": cos,
-        "mean_delta_norms": mean_delta.norm(dim=1).cpu().numpy().tolist(),
-        "action_rank": action_rank,
-        "raw_action_rank": raw_action_rank,
-        "signed_axis_count": signed_axis_count,
-        "axis_similarity_threshold": axis_similarity_threshold,
-        "inverse_pairs": inverse_pairs,
-        "singular_values": sv.cpu().numpy().tolist(),
-    }
-
-
-def probe_termination(transitions: list[Transition]) -> dict:
-    """Per-episode outcome statistics.
-
-    Splits the flat transition list back into episodes on the `done` flag,
-    then asks: how often did random exploration stumble into a positive-
-    reward terminal state, and how long did it take when it did? This is
-    our first concrete handle on 'is the agent winning?' Random play is
-    the baseline; brick 2 will replace it with novelty-weighted action
-    selection and we expect this number to go up.
-    """
-    episodes: list[list[tuple[float, bool]]] = []
-    current: list[tuple[float, bool]] = []
-    for _s, _a, _sp, r, done in transitions:
-        current.append((r, done))
+    obs = env.reset()
+    agent.reset_state()
+    episode: list[tuple[np.ndarray, int, float, bool]] = []
+    outcome_trace: list[tuple[float, bool]] = []
+    step_idx = 0
+    if watch:
+        _render_step(obs, f"{watch_label}  step 0  (reset)")
+        time.sleep(0.06)
+    while True:
+        a = agent.act(obs, rng, greedy=greedy)
+        next_obs, done, reward = env.step(a)
+        episode.append((obs, a, float(reward), bool(done)))
+        outcome_trace.append((float(reward), bool(done)))
+        step_idx += 1
+        if watch:
+            tag = " WIN" if reward > 0 else (" timeout" if done else "")
+            _render_step(next_obs, f"{watch_label}  step {step_idx}  action={a}  reward={reward}{tag}")
+            time.sleep(0.06)
+        obs = next_obs
         if done:
-            episodes.append(current)
-            current = []
-
-    num_ep = len(episodes)
-    successes = [ep for ep in episodes if any(r > 0 for r, _ in ep)]
-    failures = [ep for ep in episodes if not any(r > 0 for r, _ in ep)]
-
-    success_rate = len(successes) / num_ep if num_ep else 0.0
-    avg_len_success = float(np.mean([len(ep) for ep in successes])) if successes else 0.0
-    avg_len_failure = float(np.mean([len(ep) for ep in failures])) if failures else 0.0
-
-    return {
-        "num_episodes": num_ep,
-        "num_successful": len(successes),
-        "success_rate": success_rate,
-        "avg_steps_to_success": avg_len_success,
-        "avg_steps_to_failure": avg_len_failure,
-    }
-
-
-# ---- 4. orchestration ------------------------------------------------------
+            break
+    replay.add(episode)
+    return episode, outcome_trace
 
 
 def discover(
     env: AgentEnv,
     num_episodes: int = 300,
     train_steps: int = 5000,
-    batch_size: int = 64,
-    latent_dim: int = 32,
-    num_cycles: int = 10,
+    batch_size: int = 16,
+    seq_len: int = 16,
+    imag_horizon: int = 8,
+    train_ratio: int = 1,
     seed: int = 0,
     watch: bool = False,
     log_every: int = 0,
 ) -> dict:
-    """Closed-loop discovery: alternate collection and training.
+    """Closed-loop discovery: collect an episode, train a few steps, repeat.
 
-    The loop is `num_cycles` rounds of (collect a chunk, train a chunk). The
-    first chunk is uniform random (no learner yet); every subsequent chunk
-    uses the partially-trained learner to bias action choice toward
-    predicted-novel next states. Total work matches the old single-shot
-    version — only the *interleaving* is new, plus the novelty-biased action
-    selection that the interleaving makes possible.
+    Training cap is the smaller of (train_steps, num_episodes * train_ratio *
+    avg_episode_length). The exact knob is ``train_ratio`` — train_ratio
+    gradient steps per env step is the DreamerV3 setting.
     """
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
 
-    ep_per_cycle = max(1, num_episodes // num_cycles)
-    steps_per_cycle = max(1, train_steps // num_cycles)
+    # peek a frame to learn image shape
+    sample_obs = env.reset()
+    image_shape = (sample_obs.shape[2], sample_obs.shape[0], sample_obs.shape[1])  # (C, H, W)
+    env.reset()  # rewind; env.reset is idempotent
 
-    learner = JEPALearner(num_actions=env.num_actions, latent_dim=latent_dim)
-    transitions: list[Transition] = []
-    history: list[float] = []
-    per_cycle_outcomes: list[dict] = []
+    agent = DreamerAgent(
+        num_actions=env.num_actions,
+        image_shape=image_shape,
+        seq_len=seq_len,
+        imag_horizon=imag_horizon,
+        batch_size=batch_size,
+    )
+    replay = SequenceReplay(capacity=max(2 * num_episodes, 200))
 
-    for cycle in range(num_cycles):
-        # cycle 0 uses random actions to seed the buffer; from cycle 1 onward
-        # the learner's predictor drives action selection.
-        actor = learner if cycle > 0 else None
-        mode = "model-biased (novelty + value)" if actor else "uniform random — bootstrap"
-        print(
-            f"[learner] cycle {cycle + 1}/{num_cycles}  collecting {ep_per_cycle} episodes "
-            f"({mode})",
-            flush=True,
-        )
-        chunk = collect_transitions(
-            env,
-            ep_per_cycle,
-            rng,
-            learner=actor,
+    per_episode_outcomes: list[list[tuple[float, bool]]] = []
+    train_steps_done = 0
+
+    chunk = max(1, num_episodes // 10)
+    for ep in range(num_episodes):
+        _, trace = collect_episode(
+            env, agent, rng, replay,
             watch=watch,
-            watch_label=f"cycle {cycle + 1}/{num_cycles} ({mode})",
+            watch_label=f"ep {ep + 1}/{num_episodes}",
         )
-        per_cycle_outcomes.append(probe_termination(chunk))
-        transitions.extend(chunk)
+        per_episode_outcomes.append(trace)
 
-        print(
-            f"[learner] cycle {cycle + 1}/{num_cycles}  training {steps_per_cycle} steps "
-            f"on {len(transitions)} accumulated transitions",
-            flush=True,
-        )
-        h = train(
-            learner,
-            transitions,
-            num_steps=steps_per_cycle,
-            batch_size=batch_size,
-            rng=rng,
-            log_every=log_every,
-        )
-        history.extend(h)
-        learner.refresh_buffer()
-        learner.refresh_success_index()
+        # training: aim for train_ratio gradient steps per env step in this episode
+        env_steps_this_ep = len(trace)
+        steps_target = env_steps_this_ep * train_ratio
+        steps_remaining_in_budget = max(0, train_steps - train_steps_done)
+        steps_this_ep = min(steps_target, steps_remaining_in_budget)
+        for _ in range(steps_this_ep):
+            info = agent.train_step(replay, rng)
+            train_steps_done += 1
+            if info and log_every and train_steps_done % log_every == 0:
+                bits = ", ".join(f"{k}={v:.4f}" for k, v in info.items())
+                print(f"  step {train_steps_done:>5}  {bits}")
 
+        if (ep + 1) % chunk == 0 or ep == num_episodes - 1:
+            success_so_far = sum(1 for t in per_episode_outcomes if any(r > 0 for r, _ in t))
+            print(
+                f"[learner] episodes {ep + 1}/{num_episodes}  "
+                f"successes={success_so_far}  train_steps={train_steps_done}  "
+                f"wm_loss={agent._wm_loss_history[-1] if agent._wm_loss_history else float('nan'):.4f}",
+                flush=True,
+            )
+
+    # ---- post-training diagnostics ----
+    transitions = replay.iter_transitions()
+    frames = replay.iter_frames()
+
+    # dedup frames by raw pixels so the probes see one row per distinct state
     seen: dict[bytes, np.ndarray] = {}
-    for s, _a, sp, _r, _done in transitions:
-        seen[s.tobytes()] = s
-        seen[sp.tobytes()] = sp
+    for f in frames:
+        seen.setdefault(f.tobytes(), f)
     unique_frames = list(seen.values())
-    latents = learner.encode(unique_frames)
 
-    return {
+    encoder_fn = _encoder_fn(agent)
+    latents = encoder_fn(unique_frames)
+
+    report = {
         "transitions_recorded": len(transitions),
         "unique_frames_observed": len(unique_frames),
-        "loss_history": history,
-        "convergence": probe_convergence(history),
+        "loss_history": list(agent._wm_loss_history),
+        "convergence": probe_convergence(agent._wm_loss_history),
         "state_count": probe_state_count(latents),
         "manifold": probe_manifold_dimension(latents),
-        "action_geometry": probe_action_geometry(learner, transitions),
-        "termination": probe_termination(transitions),
-        "per_cycle_outcomes": per_cycle_outcomes,
-        "avg_predicted_value": (
-            learner._v_pred_sum / learner._v_pred_n if learner._v_pred_n else 0.0
+        "action_geometry": probe_action_geometry(
+            transitions,
+            encoder_fn=encoder_fn,
+            num_actions=env.num_actions,
+            latent_dim=latents.shape[1],
         ),
-        "success_memory": {
-            "trajectories_kept": len(learner._success_memory),
-            "best_path_length": learner._best_success_len,
-            "mem_bias_hit_rate": (
-                learner._mem_hits / learner._mem_queries
-                if learner._mem_queries
-                else 0.0
-            ),
-        },
+        "termination": probe_termination(per_episode_outcomes),
+        "actor_info": dict(agent._actor_info_last),
+        "critic_info": dict(agent._critic_info_last),
+        "avg_imagined_return": (
+            float(np.mean(agent._imagined_returns)) if agent._imagined_returns else 0.0
+        ),
+        "train_steps_done": train_steps_done,
     }
+    return report
 
+
+def _encoder_fn(agent: DreamerAgent):
+    """Returns a callable ``frames -> (N, D) tensor`` that runs frames through
+    the trained encoder. Used by the diagnostic probes.
+    """
+    @torch.no_grad()
+    def fn(frames: list[np.ndarray]) -> torch.Tensor:
+        agent.world_model.encoder.eval()
+        out = agent.world_model.encoder(frames_to_tensor(frames).to(agent.device))
+        agent.world_model.encoder.train()
+        return out.cpu()
+    return fn
+
+
+# ---- explain ---------------------------------------------------------------
 
 def explain(report: dict) -> str:
     lines: list[str] = []
@@ -842,49 +417,33 @@ def explain(report: dict) -> str:
     if t["num_successful"] < t["num_episodes"]:
         lines.append(f"  avg steps to failure: {t['avg_steps_to_failure']:.1f}")
 
-    if "per_cycle_outcomes" in report and report["per_cycle_outcomes"]:
-        per_cycle = report["per_cycle_outcomes"]
-        rate_vals = [c["success_rate"] for c in per_cycle]
-        rates = [f"{r:.0%}" for r in rate_vals]
-        lines.append(f"  per-cycle success rate: {' -> '.join(rates)}")
-        if len(rate_vals) >= 2:
-            peak = max(rate_vals)
-            peak_idx = rate_vals.index(peak)
-            final = rate_vals[-1]
-            mid = len(rate_vals) // 2
-            early = sum(rate_vals[:mid]) / max(mid, 1)
-            late = sum(rate_vals[mid:]) / max(len(rate_vals) - mid, 1)
-            lines.append(
-                f"  trend: peak {peak:.0%} (cycle {peak_idx + 1}) -> final {final:.0%}  "
-                f"|  early-half {early:.0%} vs late-half {late:.0%}"
-            )
-
-    if "avg_predicted_value" in report:
+    ai = report.get("actor_info") or {}
+    ci = report.get("critic_info") or {}
+    if ai:
         lines.append(
-            f"  avg predicted value over training: {report['avg_predicted_value']:.4f}"
+            f"  actor: policy={ai.get('actor/policy', 0.0):.4f}  "
+            f"entropy={ai.get('actor/entropy', 0.0):.4f}  "
+            f"adv_scale={ai.get('actor/adv_scale', 0.0):.4f}"
         )
-
-    if "success_memory" in report:
-        sm = report["success_memory"]
-        if sm["best_path_length"] is not None:
-            lines.append(
-                f"  best successful path length: {sm['best_path_length']} steps"
-            )
+    if ci:
         lines.append(
-            f"  success-memory bias hit rate: {sm['mem_bias_hit_rate']:.1%} "
-            f"({sm['trajectories_kept']} trajectories kept)"
+            f"  critic: main={ci.get('critic/main', 0.0):.4f}  "
+            f"slow={ci.get('critic/slow', 0.0):.4f}"
         )
+    lines.append(
+        f"  avg imagined return over training: {report.get('avg_imagined_return', 0.0):.4f}  "
+        f"(train steps: {report.get('train_steps_done', 0)})"
+    )
 
     conv = report["convergence"]
     lines.append(
-        f"convergence: final loss {conv['final_loss']:.5f}  "
+        f"convergence: final wm-loss {conv['final_loss']:.5f}  "
         f"(min {conv['min_loss']:.5f}, max {conv['max_loss']:.5f})"
     )
 
     sc = report["state_count"]
     lines.append(
-        f"distinct latent classes: {sc['distinct']}  "
-        f"(gap threshold {sc['threshold']:.4f})"
+        f"distinct latent classes: {sc['distinct']}  (gap threshold {sc['threshold']:.4f})"
     )
     lines.append(f"unique pixel frames observed: {report['unique_frames_observed']}")
 
@@ -896,11 +455,7 @@ def explain(report: dict) -> str:
     )
     if ag.get("raw_action_rank") != ag.get("action_rank"):
         threshold = ag.get("axis_similarity_threshold")
-        threshold_text = (
-            f", angle-gap threshold {threshold:.2f}"
-            if threshold is not None
-            else ""
-        )
+        threshold_text = f", angle-gap threshold {threshold:.2f}" if threshold is not None else ""
         lines.append(
             f"  raw SVD rank {ag['raw_action_rank']} compressed to "
             f"{ag['signed_axis_count']} signed movement axes{threshold_text}"
@@ -920,11 +475,6 @@ def explain(report: dict) -> str:
         f"(how spread out the encoder packs states; not the world dim)"
     )
 
-    # generic lattice hypothesis. given an N-D world with K distinct states,
-    # the simplest hypothesis is a regular N-D lattice of side K**(1/N). Use
-    # the directly observed pixel-frame count as the state-count input here;
-    # the encoder cluster count above serves as an audit that the encoder
-    # learned to keep those frames apart.
     d = ag["action_rank"]
     k = report["unique_frames_observed"]
     if d > 0 and k > 1:
@@ -936,9 +486,7 @@ def explain(report: dict) -> str:
                 f"==> structural hypothesis: regular {d}D lattice of side {side_int} ({shape})"
             )
         else:
-            lines.append(
-                f"==> {d}D structure with {k} states; not a regular lattice"
-            )
+            lines.append(f"==> {d}D structure with {k} states; not a regular lattice")
     elif d == 0:
         lines.append("==> no independent action directions detected")
     return "\n".join(lines)
