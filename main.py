@@ -63,8 +63,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--episodes", type=int, default=300)
     parser.add_argument("--train-steps", type=int, default=5000)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--cycles", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=16,
+        help="Sequence length sampled from the replay for world-model training.",
+    )
+    parser.add_argument(
+        "--imag-horizon",
+        type=int,
+        default=8,
+        help="How many steps the actor-critic rolls forward inside the world model per update.",
+    )
+    parser.add_argument(
+        "--train-ratio",
+        type=int,
+        default=1,
+        help="Gradient steps per env step. DreamerV3's main knob; default 1.",
+    )
     parser.add_argument(
         "--log-every",
         type=int,
@@ -101,7 +118,9 @@ def main() -> None:
         num_episodes=args.episodes,
         train_steps=args.train_steps,
         batch_size=args.batch_size,
-        num_cycles=args.cycles,
+        seq_len=args.seq_len,
+        imag_horizon=args.imag_horizon,
+        train_ratio=args.train_ratio,
         seed=args.seed,
         watch=args.watch,
         log_every=args.log_every,
